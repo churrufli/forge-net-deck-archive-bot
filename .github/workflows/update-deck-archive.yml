@@ -289,9 +289,9 @@ jobs:
                       sys.exit(f"{rel}: unexpected line {line!r}")
               dst.write_text(new, encoding="utf-8", newline="\n")
               total += len(extra)
-          with open(os.environ["GITHUB_ENV"], "a") as out:
-              out.write(f"LIST_ADDED={total}\n")
+          pathlib.Path(os.environ["RUNNER_TEMP"], "list_added.txt").write_text(str(total))
           PY
+          LIST_ADDED=$(cat "$RUNNER_TEMP/list_added.txt")
           git -C fg add forge-gui/res/lists
           title="Update net deck archive lists (+${LIST_ADDED} tournaments)"
           git -C fg -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "$title"
