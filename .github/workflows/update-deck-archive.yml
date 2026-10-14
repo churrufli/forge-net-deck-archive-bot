@@ -236,8 +236,13 @@ jobs:
           tar -xf "$RUNNER_TEMP/payload/zips.tar" -C fx --no-same-owner --no-same-permissions
           git -C fx add --sparse --pathspec-from-file="$RUNNER_TEMP/zips-names.txt"
           count=$(grep -c . "$RUNNER_TEMP/zips-names.txt")
-          title="Deck archive: ${count} new tournaments ($(date -u +%Y-%m-%d))"
-          git -C fx -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "Add ${count} tournament deck archives"
+          title="Update Net Deck Archive (${count} tournaments)"
+          {
+            cat "$RUNNER_TEMP/payload/report.md"
+            printf '\n---\nGenerated automatically by a GitHub Actions workflow (%s/%s).\n' "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY"
+          } > "$RUNNER_TEMP/extras-body.md"
+          { printf '%s\n\n' "$title"; cat "$RUNNER_TEMP/extras-body.md"; } > "$RUNNER_TEMP/extras-commit.md"
+          git -C fx -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -F "$RUNNER_TEMP/extras-commit.md"
           git -C fx -c "http.extraheader=Authorization: basic $GIT_AUTH" push --quiet --force origin "HEAD:refs/heads/${EXTRAS_BRANCH}"
           compare="https://github.com/${EXTRAS_REPO}/compare/${EXTRAS_BASE}...${OWNER}:forge-extras:${EXTRAS_BRANCH}?expand=1"
           if [[ "$OPEN_PR" != "true" ]]; then
@@ -246,12 +251,12 @@ jobs:
           fi
           pr=$(gh api "repos/${EXTRAS_REPO}/pulls?head=${OWNER}:${EXTRAS_BRANCH}&state=open" --jq '.[0].number // empty')
           if [[ -n "$pr" ]]; then
-            gh api -X PATCH "repos/${EXTRAS_REPO}/pulls/${pr}" -f title="$title" -f body="$(cat "$RUNNER_TEMP/payload/report.md")" > /dev/null
+            gh api -X PATCH "repos/${EXTRAS_REPO}/pulls/${pr}" -f title="$title" -f body="$(cat "$RUNNER_TEMP/extras-body.md")" > /dev/null
             url="https://github.com/${EXTRAS_REPO}/pull/${pr}"
             echo "Updated $url" >> "$GITHUB_STEP_SUMMARY"
           else
             url=$(gh api -X POST "repos/${EXTRAS_REPO}/pulls" -f title="$title" -f head="${OWNER}:${EXTRAS_BRANCH}" \
-              -f base="$EXTRAS_BASE" -f body="$(cat "$RUNNER_TEMP/payload/report.md")" --jq .html_url)
+              -f base="$EXTRAS_BASE" -f body="$(cat "$RUNNER_TEMP/extras-body.md")" --jq .html_url)
             echo "Opened $url" >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
@@ -273,6 +278,7 @@ jobs:
           fg = pathlib.Path("fg")
           new_root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "new"
           total = 0
+          rows = []
           for rel in pathlib.Path(os.environ["RUNNER_TEMP"], "lists-names.txt").read_text().split():
               fmt = re.fullmatch(r"forge-gui/res/lists/net-decks-archive-([a-z-]+)\.txt", rel).group(1)
               dst = fg / rel
@@ -289,17 +295,22 @@ jobs:
                       sys.exit(f"{rel}: unexpected line {line!r}")
               dst.write_text(new, encoding="utf-8", newline="\n")
               total += len(extra)
+              rows.append((fmt, len(extra)))
+          rows.sort()
+          table = "| List | New entries |\n|---|---|\n" + "\n".join(f"| {f} | {n} |" for f, n in rows)
+          pathlib.Path(os.environ["RUNNER_TEMP"], "forge_table.md").write_text(table)
           pathlib.Path(os.environ["RUNNER_TEMP"], "list_added.txt").write_text(str(total))
           PY
           LIST_ADDED=$(cat "$RUNNER_TEMP/list_added.txt")
           git -C fg add forge-gui/res/lists
-          title="Update net deck archive lists (+${LIST_ADDED} tournaments)"
-          git -C fg -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "$title"
-          git -C fg -c "http.extraheader=Authorization: basic $GIT_AUTH" push --quiet --force origin "HEAD:refs/heads/${FORGE_BRANCH}"
-          body="Appends the tournaments available in ${EXTRAS_REPO} decks/archive to the net deck archive lists. Only forge-gui/res/lists/net-decks-archive-*.txt change, and only by appending lines."
+          title="Update Net Deck Archive Lists (${LIST_ADDED} tournaments)"
+          body="Appends the tournaments available in ${EXTRAS_REPO} decks/archive to the net deck archive lists."$'\n\n'"$(cat "$RUNNER_TEMP/forge_table.md")"$'\n\n'"Only forge-gui/res/lists/net-decks-archive-*.txt change, and only by appending lines."
           if [[ -n "$EXTRAS_PR" ]]; then
             body="${body}"$'\n\n'"The archives these lines point to are added by ${EXTRAS_PR}. Merge that first."
           fi
+          body="${body}"$'\n\n---\n'"Generated automatically by a GitHub Actions workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})."
+          git -C fg -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "$title" -m "$body"
+          git -C fg -c "http.extraheader=Authorization: basic $GIT_AUTH" push --quiet --force origin "HEAD:refs/heads/${FORGE_BRANCH}"
           compare="https://github.com/${FORGE_REPO}/compare/${FORGE_BASE}...${OWNER}:forge:${FORGE_BRANCH}?expand=1"
           if [[ "$OPEN_PR" != "true" ]]; then
             echo "Branch pushed. Review and open the pull request: ${compare}" | tee -a "$GITHUB_STEP_SUMMARY"
