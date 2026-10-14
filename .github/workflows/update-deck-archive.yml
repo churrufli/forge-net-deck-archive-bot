@@ -139,13 +139,7 @@ jobs:
           if [[ -n "$bad" ]]; then echo "Unexpected changes in forge-extras:"; echo "$bad"; exit 1; fi
           bad=$(grep -vE '^ M forge-gui/res/lists/net-decks-archive-[a-z-]+\.txt$' "$RUNNER_TEMP/forge-status.txt" || true)
           if [[ -n "$bad" ]]; then echo "Unexpected changes in Forge:"; echo "$bad"; exit 1; fi
-          while read -r f; do
-            [[ -n "$f" ]] || continue
-            git -C forge show "HEAD:$f" > "$RUNNER_TEMP/old.txt"
-            [[ $(tail -c1 "$RUNNER_TEMP/old.txt" | wc -l) -eq 1 ]] || echo >> "$RUNNER_TEMP/old.txt"
-            size=$(stat -c %s "$RUNNER_TEMP/old.txt")
-            cmp -s -n "$size" "$RUNNER_TEMP/old.txt" "forge/$f" || { echo "$f is not append-only"; exit 1; }
-          done < <(git -C forge diff --name-only)
+          python3 -I bot/tools/check_lists.py forge
           mkdir -p "$RUNNER_TEMP/payload"
           sed -E 's/^.. //' "$RUNNER_TEMP/extras-status.txt" > "$RUNNER_TEMP/payload/zips.txt"
           sed -E 's/^.. //' "$RUNNER_TEMP/forge-status.txt" > "$RUNNER_TEMP/payload/lists.txt"
@@ -284,18 +278,23 @@ jobs:
               dst = fg / rel
               new = (new_root / rel).read_text(encoding="utf-8")
               old = dst.read_text(encoding="utf-8")
-              base = old if old.endswith("\n") else old + "\n"
-              if not new.startswith(base):
-                  sys.exit(f"{rel}: not an append-only update of the fork's version")
               pat = re.compile(r"^\d{4}-\d{2}-\d{2} [^|\r\n]+ \(\d+ decks\) \| https://github\.com/Card-Forge/forge-extras/raw/refs/heads/main/decks/archive/"
                                + re.escape(fmt) + r"/[A-Za-z0-9-]+\.zip$")
-              extra = new[len(base):].splitlines()
-              for line in extra:
-                  if not pat.match(line):
+              old_lines = old.splitlines()
+              i = 0
+              extra = 0
+              for line in new.splitlines():
+                  if i < len(old_lines) and line == old_lines[i]:
+                      i += 1
+                  elif pat.match(line):
+                      extra += 1
+                  else:
                       sys.exit(f"{rel}: unexpected line {line!r}")
+              if i != len(old_lines):
+                  sys.exit(f"{rel}: an existing line was changed, removed or reordered")
               dst.write_text(new, encoding="utf-8", newline="\n")
-              total += len(extra)
-              rows.append((fmt, len(extra)))
+              total += extra
+              rows.append((fmt, extra))
           rows.sort()
           table = "| List | New entries |\n|---|---|\n" + "\n".join(f"| {f} | {n} |" for f, n in rows)
           pathlib.Path(os.environ["RUNNER_TEMP"], "forge_table.md").write_text(table)
@@ -304,7 +303,7 @@ jobs:
           LIST_ADDED=$(cat "$RUNNER_TEMP/list_added.txt")
           git -C fg add forge-gui/res/lists
           title="Update Net Deck Archive Lists (${LIST_ADDED} tournaments)"
-          body="Appends the tournaments available in ${EXTRAS_REPO} decks/archive to the net deck archive lists."$'\n\n'"$(cat "$RUNNER_TEMP/forge_table.md")"$'\n\n'"Only forge-gui/res/lists/net-decks-archive-*.txt change, and only by appending lines."
+          body="Appends the tournaments available in ${EXTRAS_REPO} decks/archive to the net deck archive lists."$'\n\n'"$(cat "$RUNNER_TEMP/forge_table.md")"$'\n\n'"Only forge-gui/res/lists/net-decks-archive-*.txt change, and only by adding lines in chronological order."
           if [[ -z "$EXTRAS_PR" ]]; then
             EXTRAS_PR=$(gh api "repos/${EXTRAS_REPO}/pulls?head=${OWNER}:${EXTRAS_BRANCH}&state=open" --jq '.[0].html_url // empty')
           fi

@@ -373,6 +373,13 @@ def cmd_convert(args):
         report += ["| Format | New archives |", "|---|---|"]
         report += [f"| {f} | {n} |" for f, n in sorted(per_format.items())]
         report.append("")
+    if planned:
+        rows = sorted(planned.values(), key=lambda x: (x[0], x[1]))
+        report += [f"<details><summary>New tournaments ({len(rows)})</summary>", ""]
+        report += [f"- `{f}/{z}` ({len(b)} decks)" for f, z, _, b in rows[:300]]
+        if len(rows) > 300:
+            report.append(f"- ... and {len(rows) - 300} more")
+        report += ["", "</details>", ""]
     if rejected_cards:
         report += ["<details><summary>Cards that caused rejected decks</summary>", "", "| Card | Reason | Decks |", "|---|---|---|"]
         for (card, why), n in rejected_cards.most_common(100):
@@ -380,7 +387,7 @@ def cmd_convert(args):
             report.append(f"| {safe} | {why} | {n} |")
         report += ["", "</details>", ""]
     if skipped:
-        report += ["<details><summary>Skipped tournaments</summary>", ""]
+        report += [f"<details><summary>Skipped tournaments ({len(skipped)})</summary>", ""]
         report += [f"- `{z}`: {why}" for z, why in skipped[:200]]
         report += ["", "</details>", ""]
     text = "\n".join(report)
@@ -421,19 +428,30 @@ def cmd_lists(args):
             d = line[:10]
             if re.fullmatch(r"\d{4}-\d{2}-\d{2}", d) and d > last_date:
                 last_date = d
+        window_start = ""
+        if last_date:
+            window_start = (dt.date.fromisoformat(last_date) - dt.timedelta(days=args.relist_days)).isoformat()
         new = []
         for p in sorted(zdir.iterdir(), key=lambda p: p.name):
             m = ZIP_NAME_RE.match(p.name)
-            if not m or p.name in listed or m["date"] <= last_date:
+            if not m or p.name in listed or m["date"] < window_start:
                 continue
             with zipfile.ZipFile(p) as zf:
                 n = sum(1 for i in zf.infolist() if not i.is_dir() and i.filename.endswith(".dck"))
             if n >= args.min_decks:
-                new.append(f"{list_title(m, n)} | {base}/{fmt}/{p.name}")
+                new.append((p.name, f"{list_title(m, n)} | {base}/{fmt}/{p.name}"))
         if not new:
             continue
         changed += len(new)
-        body = "\n".join(lines + new)
+        merged = list(lines)
+        for key, line in new:
+            idx = len(merged)
+            for i, existing in enumerate(merged):
+                if "|" in existing and existing.split("|", 1)[1].strip().rsplit("/", 1)[-1] > key:
+                    idx = i
+                    break
+            merged.insert(idx, line)
+        body = "\n".join(merged)
         if text.endswith("\n"):
             body += "\n"
         if not args.dry_run:
@@ -469,6 +487,7 @@ def main(argv=None):
     l.add_argument("--lists", required=True, help="directory with net-decks-archive-*.txt")
     l.add_argument("--base-url", default=DEFAULT_BASE_URL)
     l.add_argument("--min-decks", type=int, default=5, help="do not list archives with fewer decks")
+    l.add_argument("--relist-days", type=int, default=14, help="also list unlisted archives up to this many days older than the newest list entry")
     l.add_argument("--dry-run", action="store_true")
     l.set_defaults(func=cmd_lists)
 
