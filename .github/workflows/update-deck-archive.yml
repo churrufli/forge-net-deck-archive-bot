@@ -305,8 +305,13 @@ jobs:
           git -C fg add forge-gui/res/lists
           title="Update Net Deck Archive Lists (${LIST_ADDED} tournaments)"
           body="Appends the tournaments available in ${EXTRAS_REPO} decks/archive to the net deck archive lists."$'\n\n'"$(cat "$RUNNER_TEMP/forge_table.md")"$'\n\n'"Only forge-gui/res/lists/net-decks-archive-*.txt change, and only by appending lines."
+          if [[ -z "$EXTRAS_PR" ]]; then
+            EXTRAS_PR=$(gh api "repos/${EXTRAS_REPO}/pulls?head=${OWNER}:${EXTRAS_BRANCH}&state=open" --jq '.[0].html_url // empty')
+          fi
           if [[ -n "$EXTRAS_PR" ]]; then
             body="${body}"$'\n\n'"The archives these lines point to are added by ${EXTRAS_PR}. Merge that first."
+          elif [[ "$HAS_ZIPS" == "true" ]]; then
+            body="${body}"$'\n\n'"The archives these lines point to are added by the branch https://github.com/${OWNER}/forge-extras/tree/${EXTRAS_BRANCH}, which still needs a pull request to ${EXTRAS_REPO}. Merge that first."
           fi
           body="${body}"$'\n\n---\n'"Generated automatically by a GitHub Actions workflow (${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY})."
           git -C fg -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "$title" -m "$body"
