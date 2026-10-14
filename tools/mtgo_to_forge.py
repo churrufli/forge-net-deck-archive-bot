@@ -346,7 +346,15 @@ def cmd_convert(args):
         stats["decks_written"] += len(built)
 
     planned_names = {z for _, z in planned}
-    skipped = [(z, why) for z, why in skipped if z not in planned_names]
+    best = {}
+    for z, why in skipped:
+        if z in planned_names:
+            continue
+        m = re.match(r"(\d+) valid decks", why)
+        rank = int(m.group(1)) if m else -1
+        if z not in best or rank > best[z][0]:
+            best[z] = (rank, why)
+    skipped = [(z, why) for z, (_, why) in best.items()]
     stats["small"] = sum(1 for _, why in skipped if "minimum" in why)
     if len(planned) > args.max_new:
         raise SystemExit(f"Refusing to write {len(planned)} archives (limit {args.max_new}); raise --max-new if this is expected")
