@@ -1,4 +1,4 @@
-# Deck archive bot
+# Forge net deck archive bot
 
 Manual workflow (Actions → Update deck archive → Run workflow) that:
 
