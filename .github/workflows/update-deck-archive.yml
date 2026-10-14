@@ -1,0 +1,316 @@
+name: Update deck archive
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "First date to process (YYYY-MM-DD) or 'auto'"
+        default: auto
+        required: true
+      formats:
+        description: "Comma-separated formats"
+        default: "standard,modern,legacy,vintage,pauper,pioneer,duel-commander"
+        required: true
+      max_new:
+        description: "Abort if more than this many new archives would be created"
+        default: "500"
+        required: true
+      dry_run:
+        description: "Only report, do not push or open pull requests"
+        type: boolean
+        default: false
+      open_pr:
+        description: "Open or update the pull requests to Card-Forge (off: only push the branches to your forks and show review links)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: update-deck-archive
+  cancel-in-progress: false
+
+env:
+  CACHE_REPO: Jiliac/MTGODecklistCache
+  FORGE_REPO: Card-Forge/forge
+  FORGE_BASE: master
+  EXTRAS_REPO: Card-Forge/forge-extras
+  EXTRAS_BASE: main
+  EXTRAS_BRANCH: bot/deck-archive
+  FORGE_BRANCH: bot/deck-archive-lists
+
+jobs:
+  convert:
+    name: Convert tournaments (no secrets)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      has_zips: ${{ steps.payload.outputs.has_zips }}
+      has_lists: ${{ steps.payload.outputs.has_lists }}
+    steps:
+      - name: Validate inputs
+        env:
+          IN_SINCE: ${{ inputs.since }}
+          IN_FORMATS: ${{ inputs.formats }}
+          IN_MAX_NEW: ${{ inputs.max_new }}
+        run: |
+          set -euo pipefail
+          [[ "$IN_SINCE" =~ ^(auto|[0-9]{4}-[0-9]{2}-[0-9]{2})$ ]] || { echo "Invalid since"; exit 1; }
+          [[ "$IN_FORMATS" =~ ^[a-z-]+(,[a-z-]+)*$ ]] || { echo "Invalid formats"; exit 1; }
+          [[ "$IN_MAX_NEW" =~ ^[0-9]{1,5}$ ]] || { echo "Invalid max_new"; exit 1; }
+          {
+            echo "SINCE=$IN_SINCE"
+            echo "FORMATS=$IN_FORMATS"
+            echo "MAX_NEW=$IN_MAX_NEW"
+          } >> "$GITHUB_ENV"
+
+      - name: Checkout tools
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: bot
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout forge-extras
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.EXTRAS_REPO }}
+          ref: ${{ env.EXTRAS_BASE }}
+          path: extras
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout Forge card scripts and lists
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FORGE_REPO }}
+          ref: ${{ env.FORGE_BASE }}
+          path: forge
+          fetch-depth: 1
+          filter: blob:none
+          sparse-checkout: |
+            forge-gui/res/cardsfolder
+            forge-gui/res/lists
+          persist-credentials: false
+
+      - name: Checkout MTGODecklistCache (recent years only)
+        run: |
+          set -euo pipefail
+          if [[ "$SINCE" == auto ]]; then
+            first=$(( $(date -u +%Y) - 1 ))
+          else
+            first=${SINCE:0:4}
+          fi
+          last=$(date -u +%Y)
+          git clone --quiet --depth 1 --filter=blob:none --no-checkout "https://github.com/${CACHE_REPO}.git" cache
+          patterns=()
+          for (( y=first; y<=last; y++ )); do patterns+=("/Tournaments/mtgo.com*/$y/" "/Tournaments/melee.gg/$y/"); done
+          git -C cache sparse-checkout set --no-cone "${patterns[@]}"
+          git -C cache checkout --quiet
+          echo "Cache commit: $(git -C cache rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Forge commit: $(git -C forge rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "forge-extras commit: $(git -C extras rev-parse HEAD)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Convert and update lists
+        run: |
+          set -euo pipefail
+          python3 -I bot/tools/mtgo_to_forge.py convert \
+            --cache cache \
+            --archive extras/decks/archive \
+            --forge-cards forge/forge-gui/res/cardsfolder \
+            --formats "$FORMATS" \
+            --since "$SINCE" \
+            --max-new "$MAX_NEW" \
+            --report "$RUNNER_TEMP/report.md"
+          python3 -I bot/tools/mtgo_to_forge.py lists \
+            --archive extras/decks/archive \
+            --lists forge/forge-gui/res/lists
+          cat "$RUNNER_TEMP/report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check changes and build payload
+        id: payload
+        run: |
+          set -euo pipefail
+          git -C extras status --porcelain --untracked-files=all > "$RUNNER_TEMP/extras-status.txt"
+          git -C forge status --porcelain --untracked-files=all > "$RUNNER_TEMP/forge-status.txt"
+          bad=$(grep -vE '^\?\? decks/archive/[a-z-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+-[a-z0-9-]+\.zip$' "$RUNNER_TEMP/extras-status.txt" || true)
+          if [[ -n "$bad" ]]; then echo "Unexpected changes in forge-extras:"; echo "$bad"; exit 1; fi
+          bad=$(grep -vE '^ M forge-gui/res/lists/net-decks-archive-[a-z-]+\.txt$' "$RUNNER_TEMP/forge-status.txt" || true)
+          if [[ -n "$bad" ]]; then echo "Unexpected changes in Forge:"; echo "$bad"; exit 1; fi
+          while read -r f; do
+            [[ -n "$f" ]] || continue
+            git -C forge show "HEAD:$f" > "$RUNNER_TEMP/old.txt"
+            [[ $(tail -c1 "$RUNNER_TEMP/old.txt" | wc -l) -eq 1 ]] || echo >> "$RUNNER_TEMP/old.txt"
+            size=$(stat -c %s "$RUNNER_TEMP/old.txt")
+            cmp -s -n "$size" "$RUNNER_TEMP/old.txt" "forge/$f" || { echo "$f is not append-only"; exit 1; }
+          done < <(git -C forge diff --name-only)
+          mkdir -p "$RUNNER_TEMP/payload"
+          sed -E 's/^.. //' "$RUNNER_TEMP/extras-status.txt" > "$RUNNER_TEMP/payload/zips.txt"
+          sed -E 's/^.. //' "$RUNNER_TEMP/forge-status.txt" > "$RUNNER_TEMP/payload/lists.txt"
+          zips=$(grep -c . "$RUNNER_TEMP/payload/zips.txt" || true)
+          lists=$(grep -c . "$RUNNER_TEMP/payload/lists.txt" || true)
+          if [[ "$zips" -gt 0 ]]; then
+            tar -cf "$RUNNER_TEMP/payload/zips.tar" -C extras --no-recursion -T "$RUNNER_TEMP/payload/zips.txt"
+          fi
+          if [[ "$lists" -gt 0 ]]; then
+            tar -cf "$RUNNER_TEMP/payload/lists.tar" -C forge --no-recursion -T "$RUNNER_TEMP/payload/lists.txt"
+          fi
+          cp "$RUNNER_TEMP/report.md" "$RUNNER_TEMP/payload/"
+          {
+            echo "has_zips=$([[ "$zips" -gt 0 ]] && echo true || echo false)"
+            echo "has_lists=$([[ "$lists" -gt 0 ]] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
+          echo "New archives: $zips; changed lists: $lists" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload payload
+        if: steps.payload.outputs.has_zips == 'true' || steps.payload.outputs.has_lists == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: deck-archive-payload
+          path: ${{ runner.temp }}/payload/
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Open pull requests
+    needs: convert
+    if: (needs.convert.outputs.has_zips == 'true' || needs.convert.outputs.has_lists == 'true') && !inputs.dry_run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      HAS_ZIPS: ${{ needs.convert.outputs.has_zips }}
+      HAS_LISTS: ${{ needs.convert.outputs.has_lists }}
+      GH_TOKEN: ${{ secrets.PR_TOKEN }}
+      OWNER: ${{ github.repository_owner }}
+      OPEN_PR: ${{ inputs.open_pr }}
+    steps:
+      - name: Download payload
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: deck-archive-payload
+          path: ${{ runner.temp }}/payload
+
+      - name: Check token and payload
+        run: |
+          set -euo pipefail
+          if [[ -z "$GH_TOKEN" ]]; then echo "Secret PR_TOKEN is missing"; exit 1; fi
+          login=$(gh api user --jq .login)
+          [[ "${login,,}" == "${OWNER,,}" ]] || { echo "PR_TOKEN belongs to $login, expected $OWNER"; exit 1; }
+          for t in zips lists; do
+            [[ -f "$RUNNER_TEMP/payload/$t.tar" ]] || continue
+            tar -tvf "$RUNNER_TEMP/payload/$t.tar" > "$RUNNER_TEMP/$t-listing.txt"
+            if grep -vE '^-' "$RUNNER_TEMP/$t-listing.txt"; then echo "$t payload contains non-regular files"; exit 1; fi
+            tar -tf "$RUNNER_TEMP/payload/$t.tar" > "$RUNNER_TEMP/$t-names.txt"
+          done
+          if [[ -f "$RUNNER_TEMP/zips-names.txt" ]] && grep -vE '^decks/archive/[a-z-]+/[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]+-[a-z0-9-]+\.zip$' "$RUNNER_TEMP/zips-names.txt"; then
+            echo "Unexpected zip paths"; exit 1
+          fi
+          if [[ -f "$RUNNER_TEMP/lists-names.txt" ]] && grep -vE '^forge-gui/res/lists/net-decks-archive-[a-z-]+\.txt$' "$RUNNER_TEMP/lists-names.txt"; then
+            echo "Unexpected list paths"; exit 1
+          fi
+          id=$(gh api user --jq .id)
+          {
+            echo "GIT_NAME=$login"
+            echo "GIT_EMAIL=${id}+${login}@users.noreply.github.com"
+          } >> "$GITHUB_ENV"
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          echo "GIT_AUTH=$auth" >> "$GITHUB_ENV"
+
+      - name: forge-extras pull request
+        id: extras
+        if: env.HAS_ZIPS == 'true'
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${OWNER}/forge-extras/merge-upstream" -f branch="$EXTRAS_BASE" > /dev/null
+          git -c "http.extraheader=Authorization: basic $GIT_AUTH" clone --quiet --depth 1 --filter=blob:none --sparse \
+            --branch "$EXTRAS_BASE" "https://github.com/${OWNER}/forge-extras.git" fx
+          git -C fx sparse-checkout set decks/archive-lists
+          while read -r f; do
+            if [[ -n "$(git -C fx ls-tree HEAD -- "$f")" ]]; then echo "Refusing to overwrite $f"; exit 1; fi
+          done < "$RUNNER_TEMP/zips-names.txt"
+          tar -xf "$RUNNER_TEMP/payload/zips.tar" -C fx --no-same-owner --no-same-permissions
+          git -C fx add --sparse --pathspec-from-file="$RUNNER_TEMP/zips-names.txt"
+          count=$(grep -c . "$RUNNER_TEMP/zips-names.txt")
+          title="Deck archive: ${count} new tournaments ($(date -u +%Y-%m-%d))"
+          git -C fx -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "Add ${count} tournament deck archives"
+          git -C fx -c "http.extraheader=Authorization: basic $GIT_AUTH" push --quiet --force origin "HEAD:refs/heads/${EXTRAS_BRANCH}"
+          compare="https://github.com/${EXTRAS_REPO}/compare/${EXTRAS_BASE}...${OWNER}:forge-extras:${EXTRAS_BRANCH}?expand=1"
+          if [[ "$OPEN_PR" != "true" ]]; then
+            echo "Branch pushed. Review and open the pull request: ${compare}" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          pr=$(gh api "repos/${EXTRAS_REPO}/pulls?head=${OWNER}:${EXTRAS_BRANCH}&state=open" --jq '.[0].number // empty')
+          if [[ -n "$pr" ]]; then
+            gh api -X PATCH "repos/${EXTRAS_REPO}/pulls/${pr}" -f title="$title" -f body="$(cat "$RUNNER_TEMP/payload/report.md")" > /dev/null
+            url="https://github.com/${EXTRAS_REPO}/pull/${pr}"
+            echo "Updated $url" >> "$GITHUB_STEP_SUMMARY"
+          else
+            url=$(gh api -X POST "repos/${EXTRAS_REPO}/pulls" -f title="$title" -f head="${OWNER}:${EXTRAS_BRANCH}" \
+              -f base="$EXTRAS_BASE" -f body="$(cat "$RUNNER_TEMP/payload/report.md")" --jq .html_url)
+            echo "Opened $url" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Forge pull request
+        if: env.HAS_LISTS == 'true'
+        env:
+          EXTRAS_PR: ${{ steps.extras.outputs.url }}
+        run: |
+          set -euo pipefail
+          gh api -X POST "repos/${OWNER}/forge/merge-upstream" -f branch="$FORGE_BASE" > /dev/null
+          git -c "http.extraheader=Authorization: basic $GIT_AUTH" clone --quiet --depth 1 --filter=blob:none --sparse \
+            --branch "$FORGE_BASE" "https://github.com/${OWNER}/forge.git" fg
+          git -C fg sparse-checkout set forge-gui/res/lists
+          mkdir -p "$RUNNER_TEMP/new"
+          tar -xf "$RUNNER_TEMP/payload/lists.tar" -C "$RUNNER_TEMP/new" --no-same-owner --no-same-permissions
+          python3 -I - <<'PY'
+          import os, pathlib, re, sys
+          fg = pathlib.Path("fg")
+          new_root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "new"
+          total = 0
+          for rel in pathlib.Path(os.environ["RUNNER_TEMP"], "lists-names.txt").read_text().split():
+              fmt = re.fullmatch(r"forge-gui/res/lists/net-decks-archive-([a-z-]+)\.txt", rel).group(1)
+              dst = fg / rel
+              new = (new_root / rel).read_text(encoding="utf-8")
+              old = dst.read_text(encoding="utf-8")
+              base = old if old.endswith("\n") else old + "\n"
+              if not new.startswith(base):
+                  sys.exit(f"{rel}: not an append-only update of the fork's version")
+              pat = re.compile(r"^\d{4}-\d{2}-\d{2} [^|\r\n]+ \(\d+ decks\) \| https://github\.com/Card-Forge/forge-extras/raw/refs/heads/main/decks/archive/"
+                               + re.escape(fmt) + r"/[A-Za-z0-9-]+\.zip$")
+              extra = new[len(base):].splitlines()
+              for line in extra:
+                  if not pat.match(line):
+                      sys.exit(f"{rel}: unexpected line {line!r}")
+              dst.write_text(new, encoding="utf-8", newline="\n")
+              total += len(extra)
+          with open(os.environ["GITHUB_ENV"], "a") as out:
+              out.write(f"LIST_ADDED={total}\n")
+          PY
+          git -C fg add forge-gui/res/lists
+          title="Update net deck archive lists (+${LIST_ADDED} tournaments)"
+          git -C fg -c user.name="$GIT_NAME" -c user.email="$GIT_EMAIL" commit --quiet -m "$title"
+          git -C fg -c "http.extraheader=Authorization: basic $GIT_AUTH" push --quiet --force origin "HEAD:refs/heads/${FORGE_BRANCH}"
+          body="Appends the tournaments available in ${EXTRAS_REPO} decks/archive to the net deck archive lists. Only forge-gui/res/lists/net-decks-archive-*.txt change, and only by appending lines."
+          if [[ -n "$EXTRAS_PR" ]]; then
+            body="${body}"$'\n\n'"The archives these lines point to are added by ${EXTRAS_PR}. Merge that first."
+          fi
+          compare="https://github.com/${FORGE_REPO}/compare/${FORGE_BASE}...${OWNER}:forge:${FORGE_BRANCH}?expand=1"
+          if [[ "$OPEN_PR" != "true" ]]; then
+            echo "Branch pushed. Review and open the pull request: ${compare}" | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          pr=$(gh api "repos/${FORGE_REPO}/pulls?head=${OWNER}:${FORGE_BRANCH}&state=open" --jq '.[0].number // empty')
+          if [[ -n "$pr" ]]; then
+            gh api -X PATCH "repos/${FORGE_REPO}/pulls/${pr}" -f title="$title" -f body="$body" > /dev/null
+            echo "Updated https://github.com/${FORGE_REPO}/pull/${pr}" >> "$GITHUB_STEP_SUMMARY"
+          else
+            url=$(gh api -X POST "repos/${FORGE_REPO}/pulls" -f title="$title" -f head="${OWNER}:${FORGE_BRANCH}" \
+              -f base="$FORGE_BASE" -f body="$body" -F draft=true --jq .html_url)
+            echo "Opened draft $url" >> "$GITHUB_STEP_SUMMARY"
+          fi
